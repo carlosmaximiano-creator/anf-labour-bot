@@ -1,11 +1,7 @@
 import os
 import logging
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -15,6 +11,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 ANF Labour Bot está online!")
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Falta a variável de ambiente BOT_TOKEN no Render.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.run_polling()
