@@ -272,4 +272,219 @@ async def today_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📅 Hoje: sem turnos registados.", reply_markup=_main_keyboard_for_role(role))
         return
 
-    lines = [f"📅 Hoje ({_today_s]()
+    lines = [f"📅 Hoje ({_today_str()}):"]
+    for s in shifts[:30]:
+        st = (s["status"] or "").upper()
+        line = f"• {s['team']} — {s['field']} — {st} — {s['start']}"
+        if s["end"]:
+            line += f"→{s['end']}"
+        if s["workers"]:
+            line += f" — 👥 {s['workers']}"
+        if s["hh"]:
+            line += f" — ⏱️ HH {s['hh']}"
+        lines.append(line)
+
+    await query.edit_message_text("\n".join(lines), reply_markup=_main_keyboard_for_role(role))
+
+
+async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    role, name = _get_user_role_and_name(query.from_user.id)
+    if not role:
+        await query.edit_message_text("⛔ Sem autorização.")
+        return
+
+    # Viewer/Admin: mostra resumo do dia; Lead: mostra o turno dele (se existir)
+    if role in ("admin", "viewer"):
+        shifts = _list_shifts_today()
+        open_count = sum(1 for s in shifts if (s["status"] or "").upper() == "OPEN")
+        closed_count = sum(1 for s in shifts if (s["status"] or "").upper() == "CLOSED")
+        await query.edit_message_text(
+            f"📋 Estado hoje ({_today_str()}):\n🟢 OPEN: {open_count}\n🔴 CLOSED: {closed_count}",
+            reply_markup=_main_keyboard_for_role(role)
+        )
+        return
+
+    # Lead
+    open_shift = _find_open_shift_for_lead_today(query.from_user.id)
+    if not open_shift:
+        await query.edit_message_text("📋 Hoje: sem turno OPEN teu.", reply_markup=_main_keyboard_for_role(role))
+        return
+    await query.edit_message_text(
+        f"📋 Turno OPEN\nShift: {open_shift['shift_id']}\nData: {_today_str()}",
+        reply_markup=_main_keyboard_for_role(role)
+    )
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    role, name = _get_user_role_and_name(user_id)
+    if not role or not _can_manage_shifts(role):
+        await query.edit_message_text(
+            "⛔ Não tens permissão para abrir turnos.",
+            reply_markup=_main_keyboard_for_role(role or "")
+        )
+        return
+
+    open_shift = _find_open_shift_for_lead_today(user_id)
+    if open_shift:
+        await query.edit_message_text(
+            f"⚠️ Já tens um turno OPEN hoje.\nShift: {open_shift['shift_id']}",
+            reply_markup=_main_keyboard_for_role(role)
+        )
+        return
+
+    context.user_data["flow_state"] = STATE_PICK_TEAM
+    await query.edit_message_text("Escolhe a equipa:", reply_markup=_teams_keyboard())
+
+
+async def off_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    role, name = _get_user_role_and_name(user_id)
+    if not role or not _can_manage_shifts(role):
+        await query.edit_message_text(
+            "⛔ Não tens permissão para fechar turnos.",
+            reply_markup=_main_keyboard_for_role(role or "")
+        )
+        return
+
+    open_shift = _find_open_shift_for_lead_today(user_id)
+    if not open_shift:
+        await query.edit_message_text("⚠️ Não tens turno OPEN hoje.", reply_markup=_main_keyboard_for_role(role))
+        return
+
+    headers = open_shift["headers"]
+    row = open_shift["row"]
+
+    def idx(col, default):
+        return headers.index(col) if col in headers else default
+
+    idx_start = idx("start_time", 5)
+    idx_workers = idx("workers_start", 7)
+
+    start_time = row[idx_start] if len(row) > idx_start else ""
+    workers_raw = row[idx_workers] if len(row) > idx_workers else "0"
+    try:
+        workers = int(str(workers_raw).strip())
+    except:
+        workers = 0
+
+    end_time = _time_str()
+    hh_total = _calc_hh_total(start_time, end_time, workers) if workers > 0 else ""
+
+    sheet_row = open_shift["sheet_row"]
+    _update_values(f"{TAB_SHIFTS}!G{sheet_row}:G{sheet_row}", [[end_time]])
+    _update_values(f"{TAB_SHIFTS}!I{sheet_row}:I{sheet_row}", [["CLOSED"]])
+    if hh_total != "":
+        _update_values(f"{TAB_SHIFTS}!J{sheet_row}:J{sheet_row}", [[hh_total]])
+
+    await query.edit_message_text(
+        f"✅ Turno fechado.\n🕒 Saída: {end_time}\n👥 Trabalhadores: {workers}\n⏱️ HH total: {hh_total}",
+        reply_markup=_main_keyboard_for_role(role)
+    )
+
+
+async def pick_team_or_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    state = context.user_data.get("flow_state")
+    data = query.data
+
+    if data.startswith("TEAM::") and state == STATE_PICK_TEAM:
+        team = data.split("TEAM::", 1)[1]
+        context.user_data["team"] = team
+        context.user_data["flow_state"] = STATE_PICK_FIELD
+        await query.edit_message_text("Escolhe o campo/parcela:", reply_markup=_fields_keyboard())
+        return
+
+    if data.startswith("FIELD::") and state == STATE_PICK_FIELD:
+        field = data.split("FIELD::", 1)[1]
+        context.user_data["field"] = field
+        context.user_data["flow_state"] = STATE_WAIT_WORKERS
+        await query.edit_message_text("Quantos trabalhadores iniciam o turno? (envia só o número, ex: 12)")
+        return
+
+    await query.edit_message_text("⚠️ Ação inválida. Recomeça com /start.")
+
+
+async def workers_count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("flow_state") != STATE_WAIT_WORKERS:
+        return
+
+    user_id = update.effective_user.id
+    role, name = _get_user_role_and_name(user_id)
+    if not role or not _can_manage_shifts(role):
+        await update.message.reply_text("⛔ Sem permissão.")
+        context.user_data.clear()
+        return
+
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        await update.message.reply_text("⚠️ Envia só um número (ex: 12).")
+        return
+
+    workers = int(text)
+    team = context.user_data.get("team")
+    field = context.user_data.get("field")
+
+    date_str = _today_str()
+    start_time = _time_str()
+    shift_id = _make_shift_id(date_str, team, field)
+
+    new_row = [
+        shift_id,
+        date_str,
+        team,
+        field,
+        str(user_id),
+        start_time,
+        "",          # end_time
+        str(workers),
+        "OPEN",
+        "",          # hh_total
+    ]
+    _append_values(f"{TAB_SHIFTS}!A:J", [new_row])
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        f"✅ Turno aberto.\nShift: {shift_id}\n👥 Trabalhadores: {workers}\n🕒 Entrada: {start_time}",
+        reply_markup=_main_keyboard_for_role(role)
+    )
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN não definido")
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID não definido")
+    if not GOOGLE_SA_JSON:
+        raise RuntimeError("GOOGLE_SA_JSON não definido")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", myid))
+
+    app.add_handler(CallbackQueryHandler(today_button, pattern="^TODAY$"))
+    app.add_handler(CallbackQueryHandler(status_button, pattern="^STATUS$"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern="^ON$"))
+    app.add_handler(CallbackQueryHandler(off_button, pattern="^OFF$"))
+    app.add_handler(CallbackQueryHandler(pick_team_or_field, pattern="^(TEAM::|FIELD::)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, workers_count_message))
+
+    print("🤖 Bot iniciado com polling (roles admin/lead/viewer)...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+
